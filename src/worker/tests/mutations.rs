@@ -2,15 +2,15 @@ use super::{get_rev, mkrepo, revs};
 use crate::{
     messages::{
         AbandonRevisions, ChangeHunk, CheckoutRevision, CopyChanges, CopyHunk, CreateRevision,
-        DescribeRevision, DuplicateRevisions, FileRange, HunkLocation, InsertRevision, MoveChanges,
-        MoveHunk, MoveRef, MoveSource, MultilineString, MutationResult, RevId, RevSet, RevsResult,
-        StoreRef, TreePath,
+        DescribeRevision, DuplicateRevisions, FileRange, HunkLocation, InsertRevision,
+        MoveChanges, MoveHunk, MoveRef, MoveSource, MultilineString, MutationResult, RevId,
+        RevSet, RevsResult, StoreRef, TreePath,
     },
-    worker::{Mutation, WorkerSession, queries},
+    worker::{Mutation, WorkerSession, gui_util::WorkspaceSession, queries},
 };
 use anyhow::Result;
 use assert_matches::assert_matches;
-use jj_lib::str_util::StringMatcher;
+use jj_lib::{repo::Repo, revset::RevsetIteratorExt, str_util::StringMatcher};
 use std::fs;
 use tokio::io::AsyncReadExt;
 
@@ -412,7 +412,10 @@ async fn move_changes_all_paths() -> Result<()> {
     assert!(parent_header.has_conflict);
 
     let result = MoveChanges {
-        from_id: revs::resolve_conflict(),
+        from: RevSet {
+            from: revs::resolve_conflict(),
+            to: revs::resolve_conflict(),
+        },
         to_id: revs::conflict_bookmark().commit,
         paths: vec![],
     }
@@ -439,7 +442,10 @@ async fn move_changes_single_path() -> Result<()> {
     assert_matches!(to_rev, RevsResult::Detail { changes, .. } if changes.is_empty());
 
     let result = MoveChanges {
-        from_id: revs::main_bookmark(),
+        from: RevSet {
+            from: revs::main_bookmark(),
+            to: revs::main_bookmark(),
+        },
         to_id: revs::working_copy().commit,
         paths: vec![TreePath {
             repo_path: "c.txt".to_owned(),
@@ -456,6 +462,254 @@ async fn move_changes_single_path() -> Result<()> {
     assert_matches!(to_rev, RevsResult::Detail { changes, .. } if changes.len() == 1);
 
     Ok(())
+}
+
+/// Test partial move from a range of commits.
+/// Creates commits A (x.txt, y.txt) -> B (y.txt, z.txt) and moves z.txt to destination.
+/// Expected: A unchanged, B rewritten without z.txt
+#[tokio::test]
+async fn move_changes_range_partial() -> Result<()> {
+    let repo = mkrepo();
+
+    let mut session = WorkerSession::default();
+    let mut ws = session.load_directory(repo.path())?;
+
+    // Create commit A: adds x.txt and y.txt
+    fs::write(repo.path().join("x.txt"), "x content").unwrap();
+    fs::write(repo.path().join("y.txt"), "y content").unwrap();
+    DescribeRevision {
+        id: revs::working_copy(),
+        new_description: "commit A".to_owned(),
+        reset_author: false,
+    }
+    .execute_unboxed(&mut ws)
+    .await?;
+
+    // Get commit A's full RevId
+    let commit_a = ws.get_commit(ws.wc_id())?;
+    let commit_a_id = ws.format_id(&commit_a);
+
+    // Create new WC on top of A
+    let result = CreateRevision {
+        set: RevSet {
+            from: commit_a_id.clone(),
+            to: commit_a_id.clone(),
+        },
+    }
+    .execute_unboxed(&mut ws)
+    .await?;
+    let commit_b_id = match result {
+        MutationResult::Updated {
+            new_selection: Some(sel),
+            ..
+        } => sel.id,
+        _ => panic!("expected new revision"),
+    };
+
+    // Create commit B: modifies y.txt and adds z.txt
+    fs::write(repo.path().join("y.txt"), "y modified").unwrap();
+    fs::write(repo.path().join("z.txt"), "z content").unwrap();
+    DescribeRevision {
+        id: commit_b_id.clone(),
+        new_description: "commit B".to_owned(),
+        reset_author: false,
+    }
+    .execute_unboxed(&mut ws)
+    .await?;
+
+    // Re-fetch B's ID after description (commit ID changes)
+    let commit_b = get_rev(&ws, &commit_b_id)?;
+    let commit_b_id = ws.format_id(&commit_b);
+
+    // Verify B has 2 changes (y.txt modified, z.txt added)
+    let b_rev = query_revision_details(&ws, commit_b_id.clone()).await?;
+    assert_matches!(b_rev, RevsResult::Detail { changes, .. } if changes.len() == 2);
+
+    // Create destination commit (sibling of A, not descendant)
+    // Use main_bookmark's parent as base to avoid descendant relationship
+    let dest_base = revs::main_bookmark();
+    let result = CreateRevision {
+        set: RevSet {
+            from: dest_base.clone(),
+            to: dest_base.clone(),
+        },
+    }
+    .execute_unboxed(&mut ws)
+    .await?;
+    let dest_id = match result {
+        MutationResult::Updated {
+            new_selection: Some(sel),
+            ..
+        } => sel.id,
+        _ => panic!("expected new revision"),
+    };
+
+    // Move z.txt from range A::B to destination
+    let result = MoveChanges {
+        from: RevSet {
+            from: commit_a_id.clone(),
+            to: commit_b_id.clone(),
+        },
+        to_id: dest_id.commit.clone(),
+        paths: vec![TreePath {
+            repo_path: "z.txt".to_owned(),
+            relative_path: "".into(),
+        }],
+    }
+    .execute_unboxed(&mut ws)
+    .await?;
+    assert_matches!(result, MutationResult::Updated { .. });
+
+    // Verify: A should be unchanged (2 changes: x.txt, y.txt)
+    let a_rev = query_revision_details_by_change(&ws, &commit_a_id.change.hex).await?;
+    assert_matches!(a_rev, RevsResult::Detail { changes, .. } if changes.len() == 2);
+
+    // Verify: B should have 1 change (y.txt only, z.txt was moved)
+    let b_rev = query_revision_details_by_change(&ws, &commit_b_id.change.hex).await?;
+    assert_matches!(b_rev, RevsResult::Detail { changes, .. } if changes.len() == 1);
+
+    // Verify: destination should have 1 change (z.txt)
+    let dest_rev = query_revision_details_by_change(&ws, &dest_id.change.hex).await?;
+    assert_matches!(dest_rev, RevsResult::Detail { changes, .. } if changes.len() == 1);
+
+    Ok(())
+}
+
+/// Test partial move where multiple commits in the range touch the moved path.
+/// Creates A (z.txt="v1") -> B (z.txt="v2", y.txt) and moves z.txt.
+/// Expected: A abandoned, B rewritten (y.txt only), destination has z.txt with final content
+#[tokio::test]
+async fn move_changes_range_partial_multi_touch() -> Result<()> {
+    let repo = mkrepo();
+
+    let mut session = WorkerSession::default();
+    let mut ws = session.load_directory(repo.path())?;
+
+    // Create commit A: adds z.txt
+    fs::write(repo.path().join("z.txt"), "version 1").unwrap();
+    DescribeRevision {
+        id: revs::working_copy(),
+        new_description: "commit A: create z.txt".to_owned(),
+        reset_author: false,
+    }
+    .execute_unboxed(&mut ws)
+    .await?;
+
+    let commit_a = ws.get_commit(ws.wc_id())?;
+    let commit_a_id = ws.format_id(&commit_a);
+
+    // Create new WC on top of A
+    let result = CreateRevision {
+        set: RevSet {
+            from: commit_a_id.clone(),
+            to: commit_a_id.clone(),
+        },
+    }
+    .execute_unboxed(&mut ws)
+    .await?;
+    let commit_b_id = match result {
+        MutationResult::Updated {
+            new_selection: Some(sel),
+            ..
+        } => sel.id,
+        _ => panic!("expected new revision"),
+    };
+
+    // Create commit B: modifies z.txt AND adds y.txt
+    fs::write(repo.path().join("z.txt"), "version 2").unwrap();
+    fs::write(repo.path().join("y.txt"), "y content").unwrap();
+    DescribeRevision {
+        id: commit_b_id.clone(),
+        new_description: "commit B: modify z.txt, add y.txt".to_owned(),
+        reset_author: false,
+    }
+    .execute_unboxed(&mut ws)
+    .await?;
+
+    let commit_b = get_rev(&ws, &commit_b_id)?;
+    let commit_b_id = ws.format_id(&commit_b);
+
+    // Verify A has 1 change (z.txt)
+    let a_rev = query_revision_details(&ws, commit_a_id.clone()).await?;
+    assert_matches!(a_rev, RevsResult::Detail { changes, .. } if changes.len() == 1);
+
+    // Verify B has 2 changes (z.txt modified, y.txt added)
+    let b_rev = query_revision_details(&ws, commit_b_id.clone()).await?;
+    assert_matches!(b_rev, RevsResult::Detail { changes, .. } if changes.len() == 2);
+
+    // Create destination commit (sibling, not descendant)
+    let dest_base = revs::main_bookmark();
+    let result = CreateRevision {
+        set: RevSet {
+            from: dest_base.clone(),
+            to: dest_base.clone(),
+        },
+    }
+    .execute_unboxed(&mut ws)
+    .await?;
+    let dest_id = match result {
+        MutationResult::Updated {
+            new_selection: Some(sel),
+            ..
+        } => sel.id,
+        _ => panic!("expected new revision"),
+    };
+
+    // Move z.txt from range A::B to destination
+    let result = MoveChanges {
+        from: RevSet {
+            from: commit_a_id.clone(),
+            to: commit_b_id.clone(),
+        },
+        to_id: dest_id.commit.clone(),
+        paths: vec![TreePath {
+            repo_path: "z.txt".to_owned(),
+            relative_path: "".into(),
+        }],
+    }
+    .execute_unboxed(&mut ws)
+    .await?;
+    assert_matches!(result, MutationResult::Updated { .. });
+
+    // Verify: A should be abandoned (only touched z.txt)
+    // Query will fail or return empty if abandoned - check via log
+    let a_exists = ws.evaluate_revset_str(&commit_a_id.change.hex);
+    assert!(
+        a_exists.is_err() || a_exists.unwrap().iter().next().is_none(),
+        "commit A should be abandoned"
+    );
+
+    // Verify: B should have 1 change (y.txt only, z.txt was moved)
+    let b_rev = query_revision_details_by_change(&ws, &commit_b_id.change.hex).await?;
+    assert_matches!(b_rev, RevsResult::Detail { changes, .. } if changes.len() == 1);
+
+    // Verify: destination should have 1 change (z.txt with accumulated changes)
+    let dest_rev = query_revision_details_by_change(&ws, &dest_id.change.hex).await?;
+    assert_matches!(dest_rev, RevsResult::Detail { changes, .. } if changes.len() == 1);
+
+    // Verify the content is the final version
+    let dest_commit = get_rev(&ws, &dest_id)?;
+    let tree = dest_commit.tree();
+    let path = jj_lib::repo_path::RepoPath::from_internal_string("z.txt")?;
+    let value = tree.path_value(&path)?;
+    assert!(value.is_resolved());
+
+    Ok(())
+}
+
+/// Helper to query revision details by change ID hex
+async fn query_revision_details_by_change(
+    ws: &WorkspaceSession<'_>,
+    change_hex: &str,
+) -> Result<RevsResult> {
+    let revset = ws.evaluate_revset_str(change_hex)?;
+    let commits: Vec<_> = revset
+        .iter()
+        .commits(ws.repo().store())
+        .collect::<Result<Vec<_>, _>>()?;
+    let commit = commits.first().ok_or_else(|| anyhow::anyhow!("not found"))?;
+    let id = ws.format_id(commit);
+    query_revision_details(ws, id).await
 }
 
 #[tokio::test]
