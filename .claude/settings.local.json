@@ -12,7 +12,14 @@
       "Bash(cargo gen:*)",
       "Bash(cargo build:*)",
       "Bash(cargo tree:*)",
-      "Bash(jj show:*)"
+      "Bash(jj show:*)",
+      "WebFetch(domain:www.anthropic.com)",
+      "Skill(update-jj)",
+      "Bash(cargo update:*)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "Bash(cargo fmt:*)",
+      "Bash(cargo clippy:*)",
+      "WebFetch(domain:github.com)"
     ]
   },
   "outputStyle": "default"
