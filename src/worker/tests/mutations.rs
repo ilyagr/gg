@@ -3,14 +3,14 @@ use crate::{
     messages::{
         AbandonRevisions, BackoutRevisions, ChangeHunk, CheckoutRevision, CopyChanges, CopyHunk,
         CreateRevision, DescribeRevision, DuplicateRevisions, FileRange, HunkLocation,
-        InsertRevision, MoveChanges, MoveHunk, MoveRef, MoveSource, MultilineString,
+        InsertRevision, MoveChanges, MoveHunk, MoveRef, MoveRevisions, MoveSource, MultilineString,
         MutationResult, RevId, RevSet, RevsResult, StoreRef, TreePath,
     },
     worker::{Mutation, WorkerSession, gui_util::WorkspaceSession, queries},
 };
 use anyhow::Result;
 use assert_matches::assert_matches;
-use jj_lib::{repo::Repo, revset::RevsetIteratorExt, str_util::StringMatcher};
+use jj_lib::{object_id::ObjectId, repo::Repo, revset::RevsetIteratorExt, str_util::StringMatcher};
 use std::fs;
 use tokio::io::AsyncReadExt;
 
@@ -881,6 +881,87 @@ async fn move_source() -> Result<()> {
 
     let page = queries::query_log(&ws, "@+", 2)?;
     assert_eq!(1, page.rows.len());
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn move_revisions_single() -> Result<()> {
+    let repo = mkrepo();
+
+    let mut session = WorkerSession::default();
+    let mut ws = session.load_directory(repo.path())?;
+
+    // resolve_conflict is initially a child of conflict_bookmark
+    // move it to be a child of main_bookmark instead
+    let before = get_rev(&ws, &revs::resolve_conflict())?;
+    let before_parents: Vec<_> = before.parent_ids().to_vec();
+    assert_eq!(before_parents.len(), 1);
+    assert_eq!(
+        before_parents[0].hex(),
+        revs::conflict_bookmark().commit.hex
+    );
+
+    MoveRevisions {
+        set: RevSet {
+            from: revs::resolve_conflict(),
+            to: revs::resolve_conflict(),
+        },
+        parent_ids: vec![revs::main_bookmark()],
+    }
+    .execute_unboxed(&mut ws)
+    .await?;
+
+    // verify it's now a child of main_bookmark
+    let after = get_rev(&ws, &revs::resolve_conflict())?;
+    let after_parents: Vec<_> = after.parent_ids().to_vec();
+    assert_eq!(after_parents.len(), 1);
+    assert_eq!(after_parents[0].hex(), revs::main_bookmark().commit.hex);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn move_revisions_range() -> Result<()> {
+    let repo = mkrepo();
+
+    let mut session = WorkerSession::default();
+    let mut ws = session.load_directory(repo.path())?;
+
+    // conflict_bookmark -> resolve_conflict is a linear range
+    // move the entire range to be children of working_copy
+    let before = get_rev(&ws, &revs::conflict_bookmark())?;
+    let before_parents: Vec<_> = before.parent_ids().to_vec();
+    // verify initial parent is NOT working_copy
+    assert!(
+        !before_parents
+            .iter()
+            .any(|p| p.hex() == revs::working_copy().commit.hex)
+    );
+
+    let result = MoveRevisions {
+        set: RevSet {
+            from: revs::conflict_bookmark(),
+            to: revs::resolve_conflict(),
+        },
+        parent_ids: vec![revs::working_copy()],
+    }
+    .execute_unboxed(&mut ws)
+    .await?;
+    assert_matches!(result, MutationResult::Updated { .. });
+
+    // verify conflict_bookmark is now a child of working_copy (the oldest in the range was rebased)
+    let after = get_rev(&ws, &revs::conflict_bookmark())?;
+    let after_parents: Vec<_> = after.parent_ids().to_vec();
+    assert_eq!(after_parents.len(), 1);
+    assert_eq!(after_parents[0].hex(), revs::working_copy().commit.hex);
+
+    // verify resolve_conflict is still a child of conflict_bookmark (internal structure preserved)
+    let resolve_after = get_rev(&ws, &revs::resolve_conflict())?;
+    let resolve_parents: Vec<_> = resolve_after.parent_ids().to_vec();
+    assert_eq!(resolve_parents.len(), 1);
+    // parent should be the NEW commit ID for conflict_bookmark (not the old one)
+    assert_eq!(resolve_parents[0], after.id().clone());
 
     Ok(())
 }
