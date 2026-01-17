@@ -40,13 +40,78 @@ async fn abandon_revisions() -> Result<()> {
     assert_eq!(24, page.rows.len());
 
     AbandonRevisions {
-        ids: vec![revs::resolve_conflict().commit],
+        set: RevSet {
+            from: revs::resolve_conflict(),
+            to: revs::resolve_conflict(),
+        },
     }
     .execute_unboxed(&mut ws)
     .await?;
 
     let page = queries::query_log(&ws, "all()", 100)?;
     assert_eq!(23, page.rows.len());
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn abandon_revisions_range() -> Result<()> {
+    let repo = mkrepo();
+
+    let mut session = WorkerSession::default();
+    let mut ws = session.load_directory(repo.path())?;
+
+    let page = queries::query_log(&ws, "all()", 100)?;
+    let initial_count = page.rows.len();
+
+    // abandon range: conflict_bookmark (parent) to resolve_conflict (child)
+    AbandonRevisions {
+        set: RevSet {
+            from: revs::conflict_bookmark(),
+            to: revs::resolve_conflict(),
+        },
+    }
+    .execute_unboxed(&mut ws)
+    .await?;
+
+    let page = queries::query_log(&ws, "all()", 100)?;
+    assert_eq!(initial_count - 2, page.rows.len());
+
+    Ok(())
+}
+
+/// Test that querying an abandoned range returns NotFound instead of an error.
+/// This verifies the frontend fallback to working copy will work after abandoning.
+#[tokio::test]
+async fn abandon_revisions_range_then_query_returns_not_found() -> Result<()> {
+    let repo = mkrepo();
+
+    let mut session = WorkerSession::default();
+    let mut ws = session.load_directory(repo.path())?;
+
+    let abandoned_set = RevSet {
+        from: revs::conflict_bookmark(),
+        to: revs::resolve_conflict(),
+    };
+
+    // verify the range exists before abandoning
+    let before_result = queries::query_revisions(&ws, abandoned_set.clone()).await?;
+    assert_matches!(before_result, RevsResult::Detail { .. });
+
+    // abandon the range
+    AbandonRevisions {
+        set: abandoned_set.clone(),
+    }
+    .execute_unboxed(&mut ws)
+    .await?;
+
+    // query the abandoned range - should return NotFound, not error
+    let after_result = queries::query_revisions(&ws, abandoned_set).await?;
+    assert_matches!(
+        after_result,
+        RevsResult::NotFound { .. },
+        "Querying abandoned range should return NotFound"
+    );
 
     Ok(())
 }
