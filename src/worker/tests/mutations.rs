@@ -3,8 +3,8 @@ use crate::{
     messages::{
         AbandonRevisions, BackoutRevisions, ChangeHunk, CheckoutRevision, CopyChanges, CopyHunk,
         CreateRevision, DescribeRevision, DuplicateRevisions, FileRange, HunkLocation,
-        InsertRevision, MoveChanges, MoveHunk, MoveRef, MoveRevisions, MoveSource, MultilineString,
-        MutationResult, RevId, RevSet, RevsResult, StoreRef, TreePath,
+        InsertRevisions, MoveChanges, MoveHunk, MoveRef, MoveRevisions, MoveSource,
+        MultilineString, MutationResult, RevId, RevSet, RevsResult, StoreRef, TreePath,
     },
     worker::{Mutation, WorkerSession, gui_util::WorkspaceSession, queries},
 };
@@ -526,7 +526,7 @@ async fn duplicate_revisions_range() -> Result<()> {
 }
 
 #[tokio::test]
-async fn insert_revision() -> Result<()> {
+async fn insert_revisions_single() -> Result<()> {
     let repo = mkrepo();
 
     let mut session = WorkerSession::default();
@@ -535,16 +535,68 @@ async fn insert_revision() -> Result<()> {
     let page = queries::query_log(&ws, "main::@", 4)?;
     assert_eq!(2, page.rows.len());
 
-    InsertRevision {
+    InsertRevisions {
+        set: RevSet {
+            from: revs::resolve_conflict(),
+            to: revs::resolve_conflict(),
+        },
         after_id: revs::main_bookmark(),
         before_id: revs::working_copy(),
-        id: revs::resolve_conflict(),
     }
     .execute_unboxed(&mut ws)
     .await?;
 
     let page = queries::query_log(&ws, "main::@", 4)?;
     assert_eq!(3, page.rows.len());
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn insert_revisions_range() -> Result<()> {
+    let repo = mkrepo();
+
+    let mut session = WorkerSession::default();
+    let mut ws = session.load_directory(repo.path())?;
+
+    // insert the range conflict_bookmark -> resolve_conflict between main and @
+    // before: main -> @
+    // after: main -> conflict_bookmark -> resolve_conflict -> @
+    let page = queries::query_log(&ws, "main::@", 5)?;
+    assert_eq!(2, page.rows.len());
+
+    let result = InsertRevisions {
+        set: RevSet {
+            from: revs::conflict_bookmark(),
+            to: revs::resolve_conflict(),
+        },
+        after_id: revs::main_bookmark(),
+        before_id: revs::working_copy(),
+    }
+    .execute_unboxed(&mut ws)
+    .await?;
+    assert_matches!(result, MutationResult::Updated { .. });
+
+    let page = queries::query_log(&ws, "main::@", 5)?;
+    assert_eq!(4, page.rows.len()); // main -> conflict_bookmark -> resolve_conflict -> @
+
+    // verify structure: conflict_bookmark is now child of main
+    let conflict_after = get_rev(&ws, &revs::conflict_bookmark())?;
+    let conflict_parents: Vec<_> = conflict_after.parent_ids().to_vec();
+    assert_eq!(conflict_parents.len(), 1);
+    assert_eq!(conflict_parents[0].hex(), revs::main_bookmark().commit.hex);
+
+    // verify resolve_conflict is still child of conflict_bookmark (internal structure preserved)
+    let resolve_after = get_rev(&ws, &revs::resolve_conflict())?;
+    let resolve_parents: Vec<_> = resolve_after.parent_ids().to_vec();
+    assert_eq!(resolve_parents.len(), 1);
+    assert_eq!(resolve_parents[0], conflict_after.id().clone());
+
+    // verify @ is now child of resolve_conflict
+    let wc_after = ws.get_commit(ws.wc_id())?;
+    let wc_parents: Vec<_> = wc_after.parent_ids().to_vec();
+    assert_eq!(wc_parents.len(), 1);
+    assert_eq!(wc_parents[0], resolve_after.id().clone());
 
     Ok(())
 }

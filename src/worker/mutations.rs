@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Display;
 use std::sync::Arc;
 
@@ -38,7 +38,7 @@ use crate::git_util::AuthContext;
 use crate::messages::{
     AbandonRevisions, BackoutRevisions, CheckoutRevision, CopyChanges, CopyHunk, CreateRef,
     CreateRevision, CreateRevisionBetween, DeleteRef, DescribeRevision, DuplicateRevisions,
-    GitFetch, GitPush, GitRefspec, InsertRevision, MoveChanges, MoveHunk, MoveRef, MoveRevisions,
+    GitFetch, GitPush, GitRefspec, InsertRevisions, MoveChanges, MoveHunk, MoveRef, MoveRevisions,
     MoveSource, MutationResult, RenameBranch, StoreRef, TrackBranch, TreePath, UndoOperation,
     UntrackBranch,
 };
@@ -398,13 +398,31 @@ impl Mutation for DuplicateRevisions {
 }
 
 #[async_trait(?Send)]
-impl Mutation for InsertRevision {
+impl Mutation for InsertRevisions {
     async fn execute(self: Box<Self>, ws: &mut WorkspaceSession) -> Result<MutationResult> {
         let mut tx = ws.start_transaction().await?;
 
-        let target = ws
-            .resolve_single_change(&self.id)
-            .context("resolve change_id")?;
+        // resolve singleton or linear range (in reverse topological order: newest first)
+        let targets = if self.set.from.change.hex == self.set.to.change.hex {
+            let commit = ws.resolve_single_change(&self.set.from)?;
+            if ws.check_immutable([commit.id().clone()])? {
+                precondition!("Revision is immutable");
+            }
+            vec![commit]
+        } else {
+            let revset_str = format!("{}::{}", self.set.from.change.hex, self.set.to.change.hex);
+            let revset = ws.evaluate_revset_str(&revset_str)?;
+            let resolved = ws.resolve_multiple(&revset)?;
+            if ws.check_immutable_revset(&*revset)? {
+                precondition!("Some revisions are immutable");
+            }
+            resolved
+        };
+
+        if targets.is_empty() {
+            return Ok(MutationResult::Unchanged);
+        }
+
         let before = ws
             .resolve_single_change(&self.before_id)
             .context("resolve before_id")?;
@@ -412,25 +430,64 @@ impl Mutation for InsertRevision {
             .resolve_single_change(&self.after_id)
             .context("resolve after_id")?;
 
-        if ws.check_immutable(vec![target.id().clone(), before.id().clone()])? {
-            precondition!("Some revisions are immutable");
+        if ws.check_immutable([before.id().clone()])? {
+            precondition!("Before revision is immutable");
         }
 
-        // rebase the target's children
-        let rebased_children = ws.disinherit_children(&mut tx, &target).await?;
+        // newest is first in the list, oldest is last
+        let newest = targets.first().expect("non-empty targets");
+        let oldest = targets.last().expect("non-empty targets");
 
-        // update after, which may have been a descendant of target
+        // build exclusion set of all commits in the range
+        let exclude: HashSet<CommitId> = targets.iter().map(|c| c.id().clone()).collect();
+
+        // disinherit only external children of the newest commit
+        let rebased_children = ws.disinherit_children(&mut tx, newest, &exclude).await?;
+
+        // update after, which may have been a descendant of the range
         let after_id = rebased_children
             .get(after.id())
             .unwrap_or(after.id())
             .clone();
 
-        // rebase the target (which now has no children), then the new post-target tree atop it
-        let rebased_id = target.id().hex();
-        let target = rewrite::rebase_commit(tx.repo_mut(), target, vec![after_id]).await?;
-        rewrite::rebase_commit(tx.repo_mut(), before, vec![target.id().clone()]).await?;
+        // rebase the oldest onto after; the rest of the range follows
+        let transaction_description = if targets.len() == 1 {
+            format!("insert commit {}", oldest.id().hex())
+        } else {
+            format!("insert {} commits", targets.len())
+        };
+        let rebased_oldest =
+            rewrite::rebase_commit(tx.repo_mut(), oldest.clone(), vec![after_id]).await?;
 
-        match ws.finish_transaction(tx, format!("rebase commit {}", rebased_id))? {
+        // find the new newest commit ID (it may have been rebased as a descendant of oldest)
+        let new_newest_id = if targets.len() == 1 {
+            rebased_oldest.id().clone()
+        } else {
+            // the newest commit was rebased as part of the descendants of oldest
+            // we need to find its new ID
+            let mut mapping = HashMap::new();
+            tx.repo_mut().rebase_descendants_with_options(
+                &RebaseOptions::default(),
+                |old_commit, rebased| {
+                    mapping.insert(
+                        old_commit.id().clone(),
+                        match rebased {
+                            RebasedCommit::Rewritten(new_commit) => new_commit.id().clone(),
+                            RebasedCommit::Abandoned { parent_id } => parent_id,
+                        },
+                    );
+                },
+            )?;
+            mapping
+                .get(newest.id())
+                .cloned()
+                .unwrap_or_else(|| newest.id().clone())
+        };
+
+        // rebase before onto the new newest
+        rewrite::rebase_commit(tx.repo_mut(), before, vec![new_newest_id]).await?;
+
+        match ws.finish_transaction(tx, transaction_description)? {
             Some(new_status) => Ok(MutationResult::Updated {
                 new_status,
                 new_selection: None,
@@ -472,7 +529,7 @@ impl Mutation for MoveRevisions {
         // disinherit only external children of the newest commit
         let exclusion_set: HashSet<CommitId> = targets.iter().map(|c| c.id().clone()).collect();
         let rebased_children = ws
-            .disinherit_children_excluding(&mut tx, newest, &exclusion_set)
+            .disinherit_children(&mut tx, newest, &exclusion_set)
             .await?;
 
         // update parents, which may have been descendants of the range
