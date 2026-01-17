@@ -1,10 +1,10 @@
 use super::{get_rev, mkrepo, revs};
 use crate::{
     messages::{
-        AbandonRevisions, ChangeHunk, CheckoutRevision, CopyChanges, CopyHunk, CreateRevision,
-        DescribeRevision, DuplicateRevisions, FileRange, HunkLocation, InsertRevision,
-        MoveChanges, MoveHunk, MoveRef, MoveSource, MultilineString, MutationResult, RevId,
-        RevSet, RevsResult, StoreRef, TreePath,
+        AbandonRevisions, BackoutRevisions, ChangeHunk, CheckoutRevision, CopyChanges, CopyHunk,
+        CreateRevision, DescribeRevision, DuplicateRevisions, FileRange, HunkLocation,
+        InsertRevision, MoveChanges, MoveHunk, MoveRef, MoveSource, MultilineString,
+        MutationResult, RevId, RevSet, RevsResult, StoreRef, TreePath,
     },
     worker::{Mutation, WorkerSession, gui_util::WorkspaceSession, queries},
 };
@@ -112,6 +112,59 @@ async fn abandon_revisions_range_then_query_returns_not_found() -> Result<()> {
         RevsResult::NotFound { .. },
         "Querying abandoned range should return NotFound"
     );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn backout_revisions() -> Result<()> {
+    let repo = mkrepo();
+
+    let mut session = WorkerSession::default();
+    let mut ws = session.load_directory(repo.path())?;
+
+    // get the working copy's initial tree
+    let wc_before = ws.get_commit(ws.wc_id())?;
+    let tree_before = wc_before.tree_ids().clone();
+
+    // backout hunk_source which changed b.txt from "1" to "11"
+    BackoutRevisions {
+        set: RevSet {
+            from: revs::hunk_source(),
+            to: revs::hunk_source(),
+        },
+    }
+    .execute_unboxed(&mut ws)
+    .await?;
+
+    // verify the working copy tree changed
+    let wc_after = ws.get_commit(ws.wc_id())?;
+    let tree_after = wc_after.tree_ids().clone();
+    assert_ne!(tree_before, tree_after);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn backout_revisions_range() -> Result<()> {
+    let repo = mkrepo();
+
+    let mut session = WorkerSession::default();
+    let mut ws = session.load_directory(repo.path())?;
+
+    // backout range: conflict_bookmark (parent) to resolve_conflict (child)
+    // these commits modify b.txt which exists in the working copy
+    let result = BackoutRevisions {
+        set: RevSet {
+            from: revs::conflict_bookmark(),
+            to: revs::resolve_conflict(),
+        },
+    }
+    .execute_unboxed(&mut ws)
+    .await?;
+
+    // verify the mutation succeeded
+    assert_matches!(result, MutationResult::Updated { .. });
 
     Ok(())
 }
@@ -772,7 +825,9 @@ async fn query_revision_details_by_change(
         .iter()
         .commits(ws.repo().store())
         .collect::<Result<Vec<_>, _>>()?;
-    let commit = commits.first().ok_or_else(|| anyhow::anyhow!("not found"))?;
+    let commit = commits
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("not found"))?;
     let id = ws.format_id(commit);
     query_revision_details(ws, id).await
 }
